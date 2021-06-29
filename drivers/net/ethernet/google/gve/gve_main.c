@@ -180,7 +180,7 @@ static int gve_napi_poll(struct napi_struct *napi, int budget)
 	/* Double check we have no extra work.
 	 * Ensure unmask synchronizes with checking for work.
 	 */
-	dma_rmb();
+	mb();
 	if (block->tx)
 		reschedule |= gve_tx_poll(block, -1);
 	if (block->rx)
@@ -220,6 +220,7 @@ static int gve_alloc_notify_blocks(struct gve_priv *priv)
 		int vecs_left = new_num_ntfy_blks % 2;
 
 		priv->num_ntfy_blks = new_num_ntfy_blks;
+		priv->mgmt_msix_idx = priv->num_ntfy_blks;
 		priv->tx_cfg.max_queues = min_t(int, priv->tx_cfg.max_queues,
 						vecs_per_type);
 		priv->rx_cfg.max_queues = min_t(int, priv->rx_cfg.max_queues,
@@ -300,20 +301,22 @@ static void gve_free_notify_blocks(struct gve_priv *priv)
 {
 	int i;
 
-	/* Free the irqs */
-	for (i = 0; i < priv->num_ntfy_blks; i++) {
-		struct gve_notify_block *block = &priv->ntfy_blocks[i];
-		int msix_idx = i;
+	if (priv->msix_vectors) {
+		/* Free the irqs */
+		for (i = 0; i < priv->num_ntfy_blks; i++) {
+			struct gve_notify_block *block = &priv->ntfy_blocks[i];
+			int msix_idx = i;
 
-		irq_set_affinity_hint(priv->msix_vectors[msix_idx].vector,
-				      NULL);
-		free_irq(priv->msix_vectors[msix_idx].vector, block);
+			irq_set_affinity_hint(priv->msix_vectors[msix_idx].vector,
+					      NULL);
+			free_irq(priv->msix_vectors[msix_idx].vector, block);
+		}
+		free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
 	}
 	dma_free_coherent(&priv->pdev->dev,
 			  priv->num_ntfy_blks * sizeof(*priv->ntfy_blocks),
 			  priv->ntfy_blocks, priv->ntfy_block_bus);
 	priv->ntfy_blocks = NULL;
-	free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
 	pci_disable_msix(priv->pdev);
 	kvfree(priv->msix_vectors);
 	priv->msix_vectors = NULL;
@@ -677,6 +680,10 @@ static int gve_alloc_qpls(struct gve_priv *priv)
 	int i, j;
 	int err;
 
+	/* Raw addressing means no QPLs */
+	if (priv->raw_addressing)
+		return 0;
+
 	priv->qpls = kvzalloc(num_qpls * sizeof(*priv->qpls), GFP_KERNEL);
 	if (!priv->qpls)
 		return -ENOMEM;
@@ -689,7 +696,7 @@ static int gve_alloc_qpls(struct gve_priv *priv)
 	}
 	for (; i < num_qpls; i++) {
 		err = gve_alloc_queue_page_list(priv, i,
-						priv->rx_pages_per_qpl);
+						priv->rx_data_slot_cnt);
 		if (err)
 			goto free_qpls;
 	}
@@ -716,6 +723,10 @@ static void gve_free_qpls(struct gve_priv *priv)
 {
 	int num_qpls = gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv);
 	int i;
+
+	/* Raw addressing means no QPLs */
+	if (priv->raw_addressing)
+		return;
 
 	kvfree(priv->qpl_cfg.qpl_id_map);
 
@@ -1077,6 +1088,7 @@ static int gve_init_priv(struct gve_priv *priv, bool skip_describe_device)
 	if (skip_describe_device)
 		goto setup_device;
 
+	priv->raw_addressing = false;
 	/* Get the initial information we need from the device */
 	err = gve_adminq_describe_device(priv);
 	if (err) {

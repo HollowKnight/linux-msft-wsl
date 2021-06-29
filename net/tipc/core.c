@@ -81,8 +81,6 @@ static int __net_init tipc_init_net(struct net *net)
 	if (err)
 		goto out_nametbl;
 
-	INIT_LIST_HEAD(&tn->dist_queue);
-
 	err = tipc_bcast_init(net);
 	if (err)
 		goto out_bclink;
@@ -121,6 +119,8 @@ static void __net_exit tipc_exit_net(struct net *net)
 #ifdef CONFIG_TIPC_CRYPTO
 	tipc_crypto_stop(&tipc_net(net)->crypto_tx);
 #endif
+	while (atomic_read(&tn->wq_count))
+		cond_resched();
 }
 
 static void __net_exit tipc_pernet_pre_exit(struct net *net)

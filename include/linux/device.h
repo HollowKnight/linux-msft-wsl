@@ -291,6 +291,7 @@ struct device_dma_parameters {
 	 * sg limitations.
 	 */
 	unsigned int max_segment_size;
+	unsigned int min_align_mask;
 	unsigned long segment_boundary_mask;
 };
 
@@ -323,6 +324,7 @@ enum device_link_state {
  * AUTOPROBE_CONSUMER: Probe consumer driver automatically after supplier binds.
  * MANAGED: The core tracks presence of supplier/consumer drivers (internal).
  * SYNC_STATE_ONLY: Link only affects sync_state() behavior.
+ * INFERRED: Inferred from data (eg: firmware) and not from driver actions.
  */
 #define DL_FLAG_STATELESS		BIT(0)
 #define DL_FLAG_AUTOREMOVE_CONSUMER	BIT(1)
@@ -332,6 +334,7 @@ enum device_link_state {
 #define DL_FLAG_AUTOPROBE_CONSUMER	BIT(5)
 #define DL_FLAG_MANAGED			BIT(6)
 #define DL_FLAG_SYNC_STATE_ONLY		BIT(7)
+#define DL_FLAG_INFERRED		BIT(8)
 
 /**
  * enum dl_dev_state - Device driver presence tracking information.
@@ -351,19 +354,13 @@ enum dl_dev_state {
  * struct dev_links_info - Device data related to device links.
  * @suppliers: List of links to supplier devices.
  * @consumers: List of links to consumer devices.
- * @needs_suppliers: Hook to global list of devices waiting for suppliers.
- * @defer_hook: Hook to global list of devices that have deferred sync_state or
- *		deferred fw_devlink.
- * @need_for_probe: If needs_suppliers is on a list, this indicates if the
- *		    suppliers are needed for probe or not.
+ * @defer_sync: Hook to global list of devices that have deferred sync_state.
  * @status: Driver status information.
  */
 struct dev_links_info {
 	struct list_head suppliers;
 	struct list_head consumers;
-	struct list_head needs_suppliers;
-	struct list_head defer_hook;
-	bool need_for_probe;
+	struct list_head defer_sync;
 	enum dl_dev_state status;
 };
 
@@ -569,7 +566,7 @@ struct device {
  * @flags: Link flags.
  * @rpm_active: Whether or not the consumer device is runtime-PM-active.
  * @kref: Count repeated addition of the same link.
- * @rcu_head: An RCU head to use for deferred execution of SRCU callbacks.
+ * @rm_work: Work structure used for removing the link.
  * @supplier_preactivated: Supplier has been made active before consumer probe.
  */
 struct device_link {
@@ -582,9 +579,7 @@ struct device_link {
 	u32 flags;
 	refcount_t rpm_active;
 	struct kref kref;
-#ifdef CONFIG_SRCU
-	struct rcu_head rcu_head;
-#endif
+	struct work_struct rm_work;
 	bool supplier_preactivated; /* Owned by consumer probe. */
 };
 

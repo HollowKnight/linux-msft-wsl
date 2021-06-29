@@ -56,10 +56,6 @@ typedef int (*hyperv_fill_flush_list_func)(
 #define hv_get_raw_timer() rdtsc_ordered()
 #define hv_get_vector() HYPERVISOR_CALLBACK_VECTOR
 
-/* On x86/x64, there isn't a real IRQ to be enabled/disable */
-static inline void hv_enable_vmbus_irq(void) {}
-static inline void hv_disable_vmbus_irq(void) {}
-
 /*
  * Reference to pv_ops must be inline so objtool
  * detection of noinstr violations can work correctly.
@@ -82,6 +78,13 @@ extern int hyperv_init_cpuhp;
 
 extern void *hv_hypercall_pg;
 extern void  __percpu  **hyperv_pcpu_input_arg;
+extern void  __percpu  **hyperv_pcpu_output_arg;
+
+extern u64 hv_current_partition_id;
+
+int hv_call_deposit_pages(int node, u64 partition_id, u32 num_pages);
+int hv_call_add_logical_proc(int node, u32 lp_index, u32 acpi_id);
+int hv_call_create_vp(int node, u64 partition_id, u32 vp_index, u32 flags);
 
 static inline u64 hv_do_hypercall(u64 control, void *input, void *output)
 {
@@ -186,6 +189,38 @@ static inline u64 hv_do_fast_hypercall16(u16 code, u64 input1, u64 input2)
 	return hv_status;
 }
 
+/*
+ * Rep hypercalls. Callers of this functions are supposed to ensure that
+ * rep_count and varhead_size comply with Hyper-V hypercall definition.
+ */
+static inline u64 hv_do_rep_hypercall(u16 code, u16 rep_count, u16 varhead_size,
+				      void *input, void *output)
+{
+	u64 control = code;
+	u64 status;
+	u16 rep_comp;
+
+	control |= (u64)varhead_size << HV_HYPERCALL_VARHEAD_OFFSET;
+	control |= (u64)rep_count << HV_HYPERCALL_REP_COMP_OFFSET;
+
+	do {
+		status = hv_do_hypercall(control, input, output);
+		if ((status & HV_HYPERCALL_RESULT_MASK) != HV_STATUS_SUCCESS)
+			return status;
+
+		/* Bits 32-43 of status have 'Reps completed' data. */
+		rep_comp = (status & HV_HYPERCALL_REP_COMP_MASK) >>
+			HV_HYPERCALL_REP_COMP_OFFSET;
+
+		control &= ~HV_HYPERCALL_REP_START_MASK;
+		control |= (u64)rep_comp << HV_HYPERCALL_REP_START_OFFSET;
+
+		touch_nmi_watchdog();
+	} while (rep_comp < rep_count);
+
+	return status;
+}
+
 extern struct hv_vp_assist_page **hv_vp_assist_page;
 
 static inline struct hv_vp_assist_page *hv_get_vp_assist_page(unsigned int cpu)
@@ -211,6 +246,8 @@ int hyperv_fill_flush_guest_mapping_list(
 		struct hv_guest_mapping_flush_list *flush,
 		u64 start_gfn, u64 end_gfn);
 
+extern bool hv_root_partition;
+
 #ifdef CONFIG_X86_64
 void hv_apic_init(void);
 void __init hv_init_spinlocks(void);
@@ -222,9 +259,15 @@ static inline void hv_apic_init(void) {}
 static inline void hv_set_msi_entry_from_desc(union hv_msi_entry *msi_entry,
 					      struct msi_desc *msi_desc)
 {
-	msi_entry->address = msi_desc->msg.address_lo;
-	msi_entry->data = msi_desc->msg.data;
+	msi_entry->address.as_uint32 = msi_desc->msg.address_lo;
+	msi_entry->data.as_uint32 = msi_desc->msg.data;
 }
+
+struct irq_domain *hv_create_pci_msi_domain(void);
+
+int hv_map_ioapic_interrupt(int ioapic_id, bool level, int vcpu, int vector,
+		struct hv_interrupt_entry *entry);
+int hv_unmap_ioapic_interrupt(int ioapic_id, struct hv_interrupt_entry *entry);
 
 #else /* CONFIG_HYPERV */
 static inline void hyperv_init(void) {}

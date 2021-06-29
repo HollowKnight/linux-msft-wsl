@@ -1422,6 +1422,12 @@ static int set_machine_constraints(struct regulator_dev *rdev)
 	 * and we have control then make sure it is enabled.
 	 */
 	if (rdev->constraints->always_on || rdev->constraints->boot_on) {
+		/* If we want to enable this regulator, make sure that we know
+		 * the supplying regulator.
+		 */
+		if (rdev->supply_name && !rdev->supply)
+			return -EPROBE_DEFER;
+
 		if (rdev->supply) {
 			ret = regulator_enable(rdev->supply);
 			if (ret < 0) {
@@ -1617,7 +1623,7 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 					  const char *supply_name)
 {
 	struct regulator *regulator;
-	int err;
+	int err = 0;
 
 	if (dev) {
 		char buf[REG_STR_SIZE];
@@ -1663,8 +1669,8 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 		}
 	}
 
-	regulator->debugfs = debugfs_create_dir(supply_name,
-						rdev->debugfs);
+	if (err != -EEXIST)
+		regulator->debugfs = debugfs_create_dir(supply_name, rdev->debugfs);
 	if (!regulator->debugfs) {
 		rdev_dbg(rdev, "Failed to create debugfs directory\n");
 	} else {
@@ -2042,7 +2048,7 @@ struct regulator *_regulator_get(struct device *dev, const char *id,
  * Returns a struct regulator corresponding to the regulator producer,
  * or IS_ERR() condition containing errno.
  *
- * Use of supply names configured via regulator_set_device_supply() is
+ * Use of supply names configured via set_consumer_device_supply() is
  * strongly encouraged.  It is recommended that the supply name used
  * should match the name used for the supply and/or the relevant
  * device pins in the datasheet.
@@ -2069,7 +2075,7 @@ EXPORT_SYMBOL_GPL(regulator_get);
  * regulator off for correct operation of the hardware they are
  * controlling.
  *
- * Use of supply names configured via regulator_set_device_supply() is
+ * Use of supply names configured via set_consumer_device_supply() is
  * strongly encouraged.  It is recommended that the supply name used
  * should match the name used for the supply and/or the relevant
  * device pins in the datasheet.
@@ -2095,7 +2101,7 @@ EXPORT_SYMBOL_GPL(regulator_get_exclusive);
  * disrupting the operation of drivers that can handle absent
  * supplies.
  *
- * Use of supply names configured via regulator_set_device_supply() is
+ * Use of supply names configured via set_consumer_device_supply() is
  * strongly encouraged.  It is recommended that the supply name used
  * should match the name used for the supply and/or the relevant
  * device pins in the datasheet.
@@ -2980,6 +2986,8 @@ static int _regulator_list_voltage(struct regulator_dev *rdev,
 	if (ops->list_voltage) {
 		if (selector >= rdev->desc->n_voltages)
 			return -EINVAL;
+		if (selector < rdev->desc->linear_min_sel)
+			return 0;
 		if (lock)
 			regulator_lock(rdev);
 		ret = ops->list_voltage(rdev, selector);
@@ -3131,6 +3139,8 @@ int regulator_list_hardware_vsel(struct regulator *regulator,
 
 	if (selector >= rdev->desc->n_voltages)
 		return -EINVAL;
+	if (selector < rdev->desc->linear_min_sel)
+		return 0;
 	if (ops->set_voltage_sel != regulator_set_voltage_sel_regmap)
 		return -EOPNOTSUPP;
 
@@ -4052,6 +4062,12 @@ int regulator_set_voltage_time(struct regulator *regulator,
 
 	for (i = 0; i < rdev->desc->n_voltages; i++) {
 		/* We only look for exact voltage matches here */
+		if (i < rdev->desc->linear_min_sel)
+			continue;
+
+		if (old_sel >= 0 && new_sel >= 0)
+			break;
+
 		voltage = regulator_list_voltage(regulator, i);
 		if (voltage < 0)
 			return -EINVAL;
@@ -4143,7 +4159,11 @@ int regulator_sync_voltage(struct regulator *regulator)
 	if (ret < 0)
 		goto out;
 
-	ret = _regulator_do_set_voltage(rdev, min_uV, max_uV);
+	/* balance only, if regulator is coupled */
+	if (rdev->coupling_desc.n_coupled > 1)
+		ret = regulator_balance_voltage(rdev, PM_SUSPEND_ON);
+	else
+		ret = _regulator_do_set_voltage(rdev, min_uV, max_uV);
 
 out:
 	regulator_unlock(rdev);
@@ -5327,6 +5347,8 @@ regulator_register(const struct regulator_desc *regulator_desc,
 		/* FIXME: this currently triggers a chicken-and-egg problem
 		 * when creating -SUPPLY symlink in sysfs to a regulator
 		 * that is just being created */
+		rdev_dbg(rdev, "will resolve supply early: %s\n",
+			 rdev->supply_name);
 		ret = regulator_resolve_supply(rdev);
 		if (!ret)
 			ret = set_machine_constraints(rdev);
@@ -5559,7 +5581,7 @@ void regulator_set_drvdata(struct regulator *regulator, void *data)
 EXPORT_SYMBOL_GPL(regulator_set_drvdata);
 
 /**
- * regulator_get_id - get regulator ID
+ * rdev_get_id - get regulator ID
  * @rdev: regulator
  */
 int rdev_get_id(struct regulator_dev *rdev)

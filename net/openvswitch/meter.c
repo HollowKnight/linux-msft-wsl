@@ -423,7 +423,7 @@ static int ovs_meter_cmd_set(struct sk_buff *skb, struct genl_info *info)
 		return -EINVAL;
 
 	meter = dp_meter_create(a);
-	if (IS_ERR_OR_NULL(meter))
+	if (IS_ERR(meter))
 		return PTR_ERR(meter);
 
 	reply = ovs_meter_cmd_reply_start(info, OVS_METER_CMD_SET,
@@ -611,6 +611,14 @@ bool ovs_meter_execute(struct datapath *dp, struct sk_buff *skb,
 	spin_lock(&meter->lock);
 
 	long_delta_ms = (now_ms - meter->used); /* ms */
+	if (long_delta_ms < 0) {
+		/* This condition means that we have several threads fighting
+		 * for a meter lock, and the one who received the packets a
+		 * bit later wins. Assuming that all racing threads received
+		 * packets at the same time to avoid overflow.
+		 */
+		long_delta_ms = 0;
+	}
 
 	/* Make sure delta_ms will not be too large, so that bucket will not
 	 * wrap around below.

@@ -38,16 +38,6 @@
 
 /* misc utils */
 
-static inline void ieee80211_tx_stats(struct net_device *dev, u32 len)
-{
-	struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
-
-	u64_stats_update_begin(&tstats->syncp);
-	tstats->tx_packets++;
-	tstats->tx_bytes += len;
-	u64_stats_update_end(&tstats->syncp);
-}
-
 static __le16 ieee80211_duration(struct ieee80211_tx_data *tx,
 				 struct sk_buff *skb, int group_addr,
 				 int next_frag_len)
@@ -317,9 +307,6 @@ ieee80211_tx_h_check_assoc(struct ieee80211_tx_data *tx)
 		return TX_DROP;
 
 	if (tx->sdata->vif.type == NL80211_IFTYPE_OCB)
-		return TX_CONTINUE;
-
-	if (tx->sdata->vif.type == NL80211_IFTYPE_WDS)
 		return TX_CONTINUE;
 
 	if (tx->flags & IEEE80211_TX_PS_BUFFERED)
@@ -1195,9 +1182,7 @@ ieee80211_tx_prepare(struct ieee80211_sub_if_data *sdata,
 			tx->sta = rcu_dereference(sdata->u.vlan.sta);
 			if (!tx->sta && sdata->wdev.use_4addr)
 				return TX_DROP;
-		} else if (info->flags & (IEEE80211_TX_INTFL_NL80211_FRAME_TX |
-					  IEEE80211_TX_CTL_INJECTED) ||
-			   tx->sdata->control_port_protocol == tx->skb->protocol) {
+		} else if (tx->sdata->control_port_protocol == tx->skb->protocol) {
 			tx->sta = sta_info_get_bss(sdata, hdr->addr1);
 		}
 		if (!tx->sta && !is_multicast_ether_addr(hdr->addr1))
@@ -1322,7 +1307,7 @@ static struct sk_buff *codel_dequeue_func(struct codel_vars *cvars,
 	fq = &local->fq;
 
 	if (cvars == &txqi->def_cvars)
-		flow = &txqi->def_flow;
+		flow = &txqi->tin.default_flow;
 	else
 		flow = &fq->flows[cvars - local->cvars];
 
@@ -1365,7 +1350,7 @@ static struct sk_buff *fq_tin_dequeue_func(struct fq *fq,
 		cparams = &local->cparams;
 	}
 
-	if (flow == &txqi->def_flow)
+	if (flow == &tin->default_flow)
 		cvars = &txqi->def_cvars;
 	else
 		cvars = &local->cvars[flow - fq->flows];
@@ -1392,17 +1377,6 @@ static void fq_skb_free_func(struct fq *fq,
 	ieee80211_free_txskb(&local->hw, skb);
 }
 
-static struct fq_flow *fq_flow_get_default_func(struct fq *fq,
-						struct fq_tin *tin,
-						int idx,
-						struct sk_buff *skb)
-{
-	struct txq_info *txqi;
-
-	txqi = container_of(tin, struct txq_info, tin);
-	return &txqi->def_flow;
-}
-
 static void ieee80211_txq_enqueue(struct ieee80211_local *local,
 				  struct txq_info *txqi,
 				  struct sk_buff *skb)
@@ -1415,8 +1389,7 @@ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
 
 	spin_lock_bh(&fq->lock);
 	fq_tin_enqueue(fq, tin, flow_idx, skb,
-		       fq_skb_free_func,
-		       fq_flow_get_default_func);
+		       fq_skb_free_func);
 	spin_unlock_bh(&fq->lock);
 }
 
@@ -1459,7 +1432,6 @@ void ieee80211_txq_init(struct ieee80211_sub_if_data *sdata,
 			struct txq_info *txqi, int tid)
 {
 	fq_tin_init(&txqi->tin);
-	fq_flow_init(&txqi->def_flow);
 	codel_vars_init(&txqi->def_cvars);
 	codel_stats_init(&txqi->cstats);
 	__skb_queue_head_init(&txqi->frags);
@@ -2030,27 +2002,10 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
 	ieee80211_tx(sdata, sta, skb, false);
 }
 
-bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
-				 struct net_device *dev)
+static bool ieee80211_validate_radiotap_len(struct sk_buff *skb)
 {
-	struct ieee80211_local *local = wdev_priv(dev->ieee80211_ptr);
-	struct ieee80211_radiotap_iterator iterator;
 	struct ieee80211_radiotap_header *rthdr =
-		(struct ieee80211_radiotap_header *) skb->data;
-	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
-	struct ieee80211_supported_band *sband =
-		local->hw.wiphy->bands[info->band];
-	int ret = ieee80211_radiotap_iterator_init(&iterator, rthdr, skb->len,
-						   NULL);
-	u16 txflags;
-	u16 rate = 0;
-	bool rate_found = false;
-	u8 rate_retries = 0;
-	u16 rate_flags = 0;
-	u8 mcs_known, mcs_flags, mcs_bw;
-	u16 vht_known;
-	u8 vht_mcs = 0, vht_nss = 0;
-	int i;
+		(struct ieee80211_radiotap_header *)skb->data;
 
 	/* check for not even having the fixed radiotap header part */
 	if (unlikely(skb->len < sizeof(struct ieee80211_radiotap_header)))
@@ -2063,6 +2018,32 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 	/* does the skb contain enough to deliver on the alleged length? */
 	if (unlikely(skb->len < ieee80211_get_radiotap_len(skb->data)))
 		return false; /* skb too short for claimed rt header extent */
+
+	return true;
+}
+
+bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
+				 struct net_device *dev)
+{
+	struct ieee80211_local *local = wdev_priv(dev->ieee80211_ptr);
+	struct ieee80211_radiotap_iterator iterator;
+	struct ieee80211_radiotap_header *rthdr =
+		(struct ieee80211_radiotap_header *) skb->data;
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	int ret = ieee80211_radiotap_iterator_init(&iterator, rthdr, skb->len,
+						   NULL);
+	u16 txflags;
+	u16 rate = 0;
+	bool rate_found = false;
+	u8 rate_retries = 0;
+	u16 rate_flags = 0;
+	u8 mcs_known, mcs_flags, mcs_bw;
+	u16 vht_known;
+	u8 vht_mcs = 0, vht_nss = 0;
+	int i;
+
+	if (!ieee80211_validate_radiotap_len(skb))
+		return false;
 
 	info->flags |= IEEE80211_TX_INTFL_DONT_ENCRYPT |
 		       IEEE80211_TX_CTL_DONTFRAG;
@@ -2113,6 +2094,9 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 				info->flags |= IEEE80211_TX_CTL_NO_ACK;
 			if (txflags & IEEE80211_RADIOTAP_F_TX_NOSEQNO)
 				info->control.flags |= IEEE80211_TX_CTRL_NO_SEQNO;
+			if (txflags & IEEE80211_RADIOTAP_F_TX_ORDER)
+				info->control.flags |=
+					IEEE80211_TX_CTRL_DONT_REORDER;
 			break;
 
 		case IEEE80211_RADIOTAP_RATE:
@@ -2143,6 +2127,19 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 			if (mcs_known & IEEE80211_RADIOTAP_MCS_HAVE_BW &&
 			    mcs_bw == IEEE80211_RADIOTAP_MCS_BW_40)
 				rate_flags |= IEEE80211_TX_RC_40_MHZ_WIDTH;
+
+			if (mcs_known & IEEE80211_RADIOTAP_MCS_HAVE_FEC &&
+			    mcs_flags & IEEE80211_RADIOTAP_MCS_FEC_LDPC)
+				info->flags |= IEEE80211_TX_CTL_LDPC;
+
+			if (mcs_known & IEEE80211_RADIOTAP_MCS_HAVE_STBC) {
+				u8 stbc = u8_get_bits(mcs_flags,
+						      IEEE80211_RADIOTAP_MCS_STBC_MASK);
+
+				info->flags |=
+					u32_encode_bits(stbc,
+							IEEE80211_TX_CTL_STBC);
+			}
 			break;
 
 		case IEEE80211_RADIOTAP_VHT:
@@ -2186,6 +2183,9 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 		return false;
 
 	if (rate_found) {
+		struct ieee80211_supported_band *sband =
+			local->hw.wiphy->bands[info->band];
+
 		info->control.flags |= IEEE80211_TX_CTRL_RATE_INJECT;
 
 		for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
@@ -2199,7 +2199,7 @@ bool ieee80211_parse_tx_radiotap(struct sk_buff *skb,
 		} else if (rate_flags & IEEE80211_TX_RC_VHT_MCS) {
 			ieee80211_rate_set_vht(info->control.rates, vht_mcs,
 					       vht_nss);
-		} else {
+		} else if (sband) {
 			for (i = 0; i < sband->n_bitrates; i++) {
 				if (rate * 5 != sband->bitrates[i].bitrate)
 					continue;
@@ -2236,8 +2236,8 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 	info->flags = IEEE80211_TX_CTL_REQ_TX_STATUS |
 		      IEEE80211_TX_CTL_INJECTED;
 
-	/* Sanity-check and process the injection radiotap header */
-	if (!ieee80211_parse_tx_radiotap(skb, dev))
+	/* Sanity-check the length of the radiotap header */
+	if (!ieee80211_validate_radiotap_len(skb))
 		goto fail;
 
 	/* we now know there is a radiotap header with a length we can use */
@@ -2279,15 +2279,6 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 						    payload[7]);
 	}
 
-	/*
-	 * Initialize skb->priority for QoS frames. This is put in the TID field
-	 * of the frame before passing it to the driver.
-	 */
-	if (ieee80211_is_data_qos(hdr->frame_control)) {
-		u8 *p = ieee80211_get_qos_ctl(hdr);
-		skb->priority = *p & IEEE80211_QOS_CTL_TAG1D_MASK;
-	}
-
 	rcu_read_lock();
 
 	/*
@@ -2295,8 +2286,7 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 	 * we handle as though they are non-injected frames.
 	 * This code here isn't entirely correct, the local MAC address
 	 * isn't always enough to find the interface to use; for proper
-	 * VLAN/WDS support we will need a different mechanism (which
-	 * likely isn't going to be monitor interfaces).
+	 * VLAN support we have an nl80211-based mechanism.
 	 *
 	 * This is necessary, for example, for old hostapd versions that
 	 * don't use nl80211-based management TX/RX.
@@ -2307,8 +2297,7 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 		if (!ieee80211_sdata_running(tmp_sdata))
 			continue;
 		if (tmp_sdata->vif.type == NL80211_IFTYPE_MONITOR ||
-		    tmp_sdata->vif.type == NL80211_IFTYPE_AP_VLAN ||
-		    tmp_sdata->vif.type == NL80211_IFTYPE_WDS)
+		    tmp_sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
 			continue;
 		if (ether_addr_equal(tmp_sdata->vif.addr, hdr->addr2)) {
 			sdata = tmp_sdata;
@@ -2352,6 +2341,23 @@ netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 		goto fail_rcu;
 
 	info->band = chandef->chan->band;
+
+	/* Initialize skb->priority according to frame type and TID class,
+	 * with respect to the sub interface that the frame will actually
+	 * be transmitted on. If the DONT_REORDER flag is set, the original
+	 * skb-priority is preserved to assure frames injected with this
+	 * flag are not reordered relative to each other.
+	 */
+	ieee80211_select_queue_80211(sdata, skb, hdr);
+	skb_set_queue_mapping(skb, ieee80211_ac_from_tid(skb->priority));
+
+	/*
+	 * Process the radiotap header. This will now take into account the
+	 * selected chandef above to accurately set injection rates and
+	 * retransmissions.
+	 */
+	if (!ieee80211_parse_tx_radiotap(skb, dev))
+		goto fail_rcu;
 
 	/* remove the injection radiotap header */
 	skb_pull(skb, len_rthdr);
@@ -2401,9 +2407,6 @@ int ieee80211_lookup_ra_sta(struct ieee80211_sub_if_data *sdata,
 			return 0;
 		}
 		sta = sta_info_get_bss(sdata, skb->data);
-		break;
-	case NL80211_IFTYPE_WDS:
-		sta = sta_info_get(sdata, sdata->u.wds.remote_addr);
 		break;
 #ifdef CONFIG_MAC80211_MESH
 	case NL80211_IFTYPE_MESH_POINT:
@@ -2579,20 +2582,6 @@ static struct sk_buff *ieee80211_build_hdr(struct ieee80211_sub_if_data *sdata,
 		memcpy(hdr.addr3, skb->data + ETH_ALEN, ETH_ALEN);
 		hdrlen = 24;
 		band = chanctx_conf->def.chan->band;
-		break;
-	case NL80211_IFTYPE_WDS:
-		fc |= cpu_to_le16(IEEE80211_FCTL_FROMDS | IEEE80211_FCTL_TODS);
-		/* RA TA DA SA */
-		memcpy(hdr.addr1, sdata->u.wds.remote_addr, ETH_ALEN);
-		memcpy(hdr.addr2, sdata->vif.addr, ETH_ALEN);
-		memcpy(hdr.addr3, skb->data, ETH_ALEN);
-		memcpy(hdr.addr4, skb->data + ETH_ALEN, ETH_ALEN);
-		hdrlen = 30;
-		/*
-		 * This is the exception! WDS style interfaces are prohibited
-		 * when channel contexts are in used so this must be valid
-		 */
-		band = local->hw.conf.chandef.chan->band;
 		break;
 #ifdef CONFIG_MAC80211_MESH
 	case NL80211_IFTYPE_MESH_POINT:
@@ -3310,8 +3299,7 @@ static bool ieee80211_amsdu_aggregate(struct ieee80211_sub_if_data *sdata,
 	 */
 
 	tin = &txqi->tin;
-	flow = fq_flow_classify(fq, tin, flow_idx, skb,
-				fq_flow_get_default_func);
+	flow = fq_flow_classify(fq, tin, flow_idx, skb);
 	head = skb_peek_tail(&flow->queue);
 	if (!head || skb_is_gso(head))
 		goto out;
@@ -3378,8 +3366,6 @@ out_recalc:
 	if (head->len != orig_len) {
 		flow->backlog += head->len - orig_len;
 		tin->backlog_bytes += head->len - orig_len;
-
-		fq_recalc_backlog(fq, tin, flow);
 	}
 out:
 	spin_unlock_bh(&fq->lock);
@@ -3403,7 +3389,7 @@ static void ieee80211_xmit_fast_finish(struct ieee80211_sub_if_data *sdata,
 	if (key)
 		info->control.hw_key = &key->conf;
 
-	ieee80211_tx_stats(skb->dev, skb->len);
+	dev_sw_netstats_tx_add(skb->dev, 1, skb->len);
 
 	if (hdr->frame_control & cpu_to_le16(IEEE80211_STYPE_QOS_DATA)) {
 		tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
@@ -3605,7 +3591,7 @@ begin:
 	    test_bit(IEEE80211_TXQ_STOP_NETIF_TX, &txqi->flags))
 		goto out;
 
-	if (vif->txqs_stopped[ieee80211_ac_from_tid(txq->tid)]) {
+	if (vif->txqs_stopped[txq->ac]) {
 		set_bit(IEEE80211_TXQ_STOP_NETIF_TX, &txqi->flags);
 		goto out;
 	}
@@ -3850,6 +3836,8 @@ void __ieee80211_schedule_txq(struct ieee80211_hw *hw,
 }
 EXPORT_SYMBOL(__ieee80211_schedule_txq);
 
+DEFINE_STATIC_KEY_FALSE(aql_disable);
+
 bool ieee80211_txq_airtime_check(struct ieee80211_hw *hw,
 				 struct ieee80211_txq *txq)
 {
@@ -3857,6 +3845,9 @@ bool ieee80211_txq_airtime_check(struct ieee80211_hw *hw,
 	struct ieee80211_local *local = hw_to_local(hw);
 
 	if (!wiphy_ext_feature_isset(local->hw.wiphy, NL80211_EXT_FEATURE_AQL))
+		return true;
+
+	if (static_branch_unlikely(&aql_disable))
 		return true;
 
 	if (!txq->sta)
@@ -4021,7 +4012,7 @@ void __ieee80211_subif_start_xmit(struct sk_buff *skb,
 			goto out;
 		}
 
-		ieee80211_tx_stats(dev, skb->len);
+		dev_sw_netstats_tx_add(dev, 1, skb->len);
 
 		ieee80211_xmit(sdata, sta, skb);
 	}
@@ -4248,7 +4239,7 @@ static void ieee80211_8023_xmit(struct ieee80211_sub_if_data *sdata,
 
 	info->hw_queue = sdata->vif.hw_queue[skb_get_queue_mapping(skb)];
 
-	ieee80211_tx_stats(dev, skb->len);
+	dev_sw_netstats_tx_add(dev, 1, skb->len);
 
 	sta->tx_stats.bytes[skb_get_queue_mapping(skb)] += skb->len;
 	sta->tx_stats.packets[skb_get_queue_mapping(skb)]++;
@@ -4421,9 +4412,10 @@ static bool ieee80211_tx_pending_skb(struct ieee80211_local *local,
 /*
  * Transmit all pending packets. Called from tasklet.
  */
-void ieee80211_tx_pending(unsigned long data)
+void ieee80211_tx_pending(struct tasklet_struct *t)
 {
-	struct ieee80211_local *local = (struct ieee80211_local *)data;
+	struct ieee80211_local *local = from_tasklet(local, t,
+						     tx_pending_tasklet);
 	unsigned long flags;
 	int i;
 	bool txok;
@@ -5437,6 +5429,7 @@ int ieee80211_tx_control_port(struct wiphy *wiphy, struct net_device *dev,
 {
 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
 	struct ieee80211_local *local = sdata->local;
+	struct sta_info *sta;
 	struct sk_buff *skb;
 	struct ethhdr *ehdr;
 	u32 ctrl_flags = 0;
@@ -5459,8 +5452,7 @@ int ieee80211_tx_control_port(struct wiphy *wiphy, struct net_device *dev,
 	if (cookie)
 		ctrl_flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 
-	flags |= IEEE80211_TX_INTFL_NL80211_FRAME_TX |
-		 IEEE80211_TX_CTL_INJECTED;
+	flags |= IEEE80211_TX_INTFL_NL80211_FRAME_TX;
 
 	skb = dev_alloc_skb(local->hw.extra_tx_headroom +
 			    sizeof(struct ethhdr) + len);
@@ -5477,9 +5469,24 @@ int ieee80211_tx_control_port(struct wiphy *wiphy, struct net_device *dev,
 	ehdr->h_proto = proto;
 
 	skb->dev = dev;
-	skb->protocol = htons(ETH_P_802_3);
+	skb->protocol = proto;
 	skb_reset_network_header(skb);
 	skb_reset_mac_header(skb);
+
+	/* update QoS header to prioritize control port frames if possible,
+	 * priorization also happens for control port frames send over
+	 * AF_PACKET
+	 */
+	rcu_read_lock();
+
+	if (ieee80211_lookup_ra_sta(sdata, skb, &sta) == 0 && !IS_ERR(sta)) {
+		u16 queue = __ieee80211_select_queue(sdata, sta, skb);
+
+		skb_set_queue_mapping(skb, queue);
+		skb_get_hash(skb);
+	}
+
+	rcu_read_unlock();
 
 	/* mutex lock is only needed for incrementing the cookie counter */
 	mutex_lock(&local->mtx);

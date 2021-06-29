@@ -21,7 +21,7 @@
 #include <linux/memory.h>
 #include <linux/notifier.h>
 #include <linux/percpu_counter.h>
-#include <linux/page_reporting.h>
+
 #include <linux/hyperv.h>
 #include <asm/hyperv-tlfs.h>
 
@@ -563,9 +563,6 @@ struct hv_dynmem_device {
 	 * The negotiated version agreed by host.
 	 */
 	__u32 version;
-#ifdef CONFIG_PAGE_REPORTING
-	struct page_reporting_dev_info ph_dev_info;
-#endif
 };
 
 static struct hv_dynmem_device dm_device;
@@ -729,7 +726,7 @@ static void hv_mem_hot_add(unsigned long start, unsigned long size,
 
 		nid = memory_add_physaddr_to_nid(PFN_PHYS(start_pfn));
 		ret = add_memory(nid, PFN_PHYS((start_pfn)),
-				(HA_CHUNK << PAGE_SHIFT), MEMHP_MERGE_RESOURCE);
+				(HA_CHUNK << PAGE_SHIFT), MHP_MERGE_RESOURCE);
 
 		if (ret) {
 			pr_err("hot_add memory failed error is %d\n", ret);
@@ -1201,6 +1198,7 @@ static void free_balloon_pages(struct hv_dynmem_device *dm,
 		__ClearPageOffline(pg);
 		__free_page(pg);
 		dm->num_pages_ballooned--;
+		adjust_managed_page_count(pg, 1);
 	}
 }
 
@@ -1241,8 +1239,10 @@ static unsigned int alloc_balloon_pages(struct hv_dynmem_device *dm,
 			split_page(pg, get_order(alloc_unit << PAGE_SHIFT));
 
 		/* mark all pages offline */
-		for (j = 0; j < (1 << get_order(alloc_unit << PAGE_SHIFT)); j++)
+		for (j = 0; j < alloc_unit; j++) {
 			__SetPageOffline(pg + j);
+			adjust_managed_page_count(pg + j, -1);
+		}
 
 		bl_resp->range_count++;
 		bl_resp->range_array[i].finfo.start_page =
@@ -1568,88 +1568,6 @@ static void balloon_onchannelcallback(void *context)
 
 }
 
-#ifdef CONFIG_PAGE_REPORTING
-static int hyperv_discard_pages(struct scatterlist **sgs, int nents)
-{
-	unsigned long flags;
-	struct hv_memory_hint *hint;
-	int i;
-	struct scatterlist *sg;
-	u64 status;
-
-	WARN_ON(nents > HV_MAX_GPA_PAGE_RANGES);
-	local_irq_save(flags);
-	hint = *(struct hv_memory_hint **)this_cpu_ptr(hyperv_pcpu_input_arg);
-	if (!hint) {
-		local_irq_restore(flags);
-		return -EINVAL;
-	}
-
-	hint->type = HV_MEMORY_HINT_TYPE_COLD_DISCARD;
-	hint->reserved = 0;
-	for (i = 0, sg = sgs[0]; sg; sg = sg_next(sg), i++) {
-		int order;
-		union hv_gpa_page_range *range;
-
-		order = get_order(sg->length);
-		range = &hint->ranges[i];
-		range->address_space = 0;
-		range->page.largepage = 1;
-		range->page.additional_pages = (1ull << (order - 9)) - 1;
-		range->base_large_pfn = page_to_pfn(sg_page(sg)) >> 9;
-	}
-
-	WARN_ON(i != nents);
-
-	status = hv_do_rep_hypercall(HVCALL_MEMORY_HEAT_HINT, nents, 0,
-				     hint, NULL);
-	local_irq_restore(flags);
-	status &= HV_HYPERCALL_RESULT_MASK;
-	if (status != HV_STATUS_SUCCESS) {
-		WARN_ONCE(1,
-		"Cold memory discard hypercall failed with status 0x%llx\n",
-			status);
-		return -EINVAL;
-	} else {
-		return 0;
-	}
-}
-
-static int hv_page_hinting(struct page_reporting_dev_info *ph_dev_info,
-		struct scatterlist *sg, unsigned int nents)
-{
-	return hyperv_discard_pages(&sg, nents);
-}
-
-static void enable_page_reporting(void)
-{
-	int ret;
-
-	if (!hyperv_query_ext_cap(HV_CAPABILITY_MEMORY_COLD_DISCARD_HINT)) {
-		pr_info("Cold memory discard hint not supported.\n");
-		return;
-	}
-
-	BUILD_BUG_ON(PAGE_REPORTING_CAPACITY > HV_MAX_GPA_PAGE_RANGES);
-	dm_device.ph_dev_info.report = hv_page_hinting;
-	ret = page_reporting_register(&dm_device.ph_dev_info);
-	if (ret < 0) {
-		pr_err("Failed to enable cold memory discard: %d\n", ret);
-		dm_device.ph_dev_info.report = NULL;
-	} else {
-		pr_info("Cold memory discard hint enabled\n");
-	}
-}
-
-static void disable_hinting(void)
-{
-	if (dm_device.ph_dev_info.report) {
-		page_reporting_unregister(&dm_device.ph_dev_info);
-		dm_device.ph_dev_info.report = NULL;
-	}
-}
-#endif //CONFIG_PAGE_REPORTING
-
 static int balloon_connect_vsp(struct hv_device *dev)
 {
 	struct dm_version_request version_req;
@@ -1795,10 +1713,6 @@ static int balloon_probe(struct hv_device *dev,
 	if (ret != 0)
 		return ret;
 
-#ifdef CONFIG_PAGE_REPORTING
-	enable_page_reporting();
-#endif
-
 	dm_device.state = DM_INITIALIZED;
 
 	dm_device.thread =
@@ -1814,9 +1728,6 @@ probe_error:
 	dm_device.state = DM_INIT_ERROR;
 	dm_device.thread  = NULL;
 	vmbus_close(dev->channel);
-#ifdef CONFIG_PAGE_REPORTING
-	disable_hinting();
-#endif
 #ifdef CONFIG_MEMORY_HOTPLUG
 	unregister_memory_notifier(&hv_memory_nb);
 	restore_online_page_callback(&hv_online_page);
@@ -1839,9 +1750,6 @@ static int balloon_remove(struct hv_device *dev)
 
 	kthread_stop(dm->thread);
 	vmbus_close(dev->channel);
-#ifdef CONFIG_PAGE_REPORTING
-	disable_hinting();
-#endif
 #ifdef CONFIG_MEMORY_HOTPLUG
 	unregister_memory_notifier(&hv_memory_nb);
 	restore_online_page_callback(&hv_online_page);

@@ -12,6 +12,19 @@
 #include <linux/pps_kernel.h>
 #include <linux/ptp_clock.h>
 
+/**
+ * struct ptp_clock_request - request PTP clock event
+ *
+ * @type:   The type of the request.
+ *	    EXTTS:  Configure external trigger timestamping
+ *	    PEROUT: Configure periodic output signal (e.g. PPS)
+ *	    PPS:    trigger internal PPS event for input
+ *	            into kernel PPS subsystem
+ * @extts:  describes configuration for external trigger timestamping.
+ *          This is only valid when event == PTP_CLK_REQ_EXTTS.
+ * @perout: describes configuration for periodic output.
+ *	    This is only valid when event == PTP_CLK_REQ_PEROUT.
+ */
 
 struct ptp_clock_request {
 	enum {
@@ -222,7 +235,7 @@ extern int ptp_clock_index(struct ptp_clock *ptp);
  * @ppm:    Parts per million, but with a 16 bit binary fractional field
  */
 
-extern s32 scaled_ppm_to_ppb(long ppm);
+extern long scaled_ppm_to_ppb(long ppm);
 
 /**
  * ptp_find_pin() - obtain the pin index of a given auxiliary function

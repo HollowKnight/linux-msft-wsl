@@ -435,8 +435,8 @@ struct nfs_client *nfs4_init_client(struct nfs_client *clp,
 		 */
 		nfs_mark_client_ready(clp, -EPERM);
 	}
-	nfs_put_client(clp);
 	clear_bit(NFS_CS_TSM_POSSIBLE, &clp->cl_flags);
+	nfs_put_client(clp);
 	return old;
 
 error:
@@ -609,6 +609,7 @@ found:
 			 * changed. Schedule recovery!
 			 */
 			nfs4_schedule_path_down_recovery(pos);
+			goto out;
 		default:
 			goto out;
 		}
@@ -1153,7 +1154,7 @@ struct nfs_server *nfs4_create_server(struct fs_context *fc)
 	if (!server)
 		return ERR_PTR(-ENOMEM);
 
-	server->cred = get_cred(current_cred());
+	server->cred = get_cred(fc->cred);
 
 	auth_probe = ctx->auth_info.flavor_len < 1;
 

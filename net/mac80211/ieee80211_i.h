@@ -50,12 +50,6 @@ struct ieee80211_local;
 #define IEEE80211_ENCRYPT_HEADROOM 8
 #define IEEE80211_ENCRYPT_TAILROOM 18
 
-/* IEEE 802.11 (Ch. 9.5 Defragmentation) requires support for concurrent
- * reception of at least three fragmented frames. This limit can be increased
- * by changing this define, at the cost of slower frame reassembly and
- * increased memory use (about 2 kB of RAM per entry). */
-#define IEEE80211_FRAGMENT_MAX 4
-
 /* power level hasn't been configured (or set to automatic) */
 #define IEEE80211_UNSET_POWER_LEVEL	INT_MIN
 
@@ -87,18 +81,6 @@ extern const u8 ieee80211_ac_to_qos_mask[IEEE80211_NUM_ACS];
 #define IEEE80211_DEAUTH_FRAME_LEN	(24 /* hdr */ + 2 /* reason */)
 
 #define IEEE80211_MAX_NAN_INSTANCE_ID 255
-
-struct ieee80211_fragment_entry {
-	struct sk_buff_head skb_list;
-	unsigned long first_frag_time;
-	u16 seq;
-	u16 extra_len;
-	u16 last_frag;
-	u8 rx_queue;
-	bool check_sequential_pn; /* needed for CCMP/GCMP */
-	u8 last_pn[6]; /* PN of the last fragment if CCMP was used */
-};
-
 
 struct ieee80211_bss {
 	u32 device_ts_beacon, device_ts_presp;
@@ -241,8 +223,15 @@ struct ieee80211_rx_data {
 	 */
 	int security_idx;
 
-	u32 tkip_iv32;
-	u16 tkip_iv16;
+	union {
+		struct {
+			u32 iv32;
+			u16 iv16;
+		} tkip;
+		struct {
+			u8 pn[IEEE80211_CCMP_PN_LEN];
+		} ccm_gcm;
+	};
 };
 
 struct ieee80211_csa_settings {
@@ -309,11 +298,6 @@ struct ieee80211_if_ap {
 	atomic_t num_mcast_sta; /* number of stations receiving multicast */
 
 	bool multicast_to_unicast;
-};
-
-struct ieee80211_if_wds {
-	struct sta_info *sta;
-	u8 remote_addr[ETH_ALEN];
 };
 
 struct ieee80211_if_vlan {
@@ -457,7 +441,9 @@ struct ieee80211_if_managed {
 	unsigned long probe_timeout;
 	int probe_send_count;
 	bool nullfunc_failed;
-	bool connection_loss;
+	u8 connection_loss:1,
+	   driver_disconnect:1,
+	   reconnect:1;
 
 	struct cfg80211_bss *associated;
 	struct ieee80211_mgd_auth_data *auth_data;
@@ -851,7 +837,6 @@ enum txq_info_flags {
  */
 struct txq_info {
 	struct fq_tin tin;
-	struct fq_flow def_flow;
 	struct codel_vars def_cvars;
 	struct codel_stats cstats;
 	struct sk_buff_head frags;
@@ -906,9 +891,7 @@ struct ieee80211_sub_if_data {
 
 	char name[IFNAMSIZ];
 
-	/* Fragment table for host-based reassembly */
-	struct ieee80211_fragment_entry	fragments[IEEE80211_FRAGMENT_MAX];
-	unsigned int fragment_next;
+	struct ieee80211_fragment_cache frags;
 
 	/* TID bitmap for NoAck policy */
 	u16 noack_map;
@@ -985,7 +968,6 @@ struct ieee80211_sub_if_data {
 
 	union {
 		struct ieee80211_if_ap ap;
-		struct ieee80211_if_wds wds;
 		struct ieee80211_if_vlan vlan;
 		struct ieee80211_if_managed mgd;
 		struct ieee80211_if_ibss ibss;
@@ -1147,6 +1129,8 @@ enum mac80211_scan_state {
 	SCAN_RESUME,
 	SCAN_ABORT,
 };
+
+DECLARE_STATIC_KEY_FALSE(aql_disable);
 
 struct ieee80211_local {
 	/* embed the driver visible part.
@@ -1594,13 +1578,8 @@ ieee80211_have_rx_timestamp(struct ieee80211_rx_status *status)
 {
 	WARN_ON_ONCE(status->flag & RX_FLAG_MACTIME_START &&
 		     status->flag & RX_FLAG_MACTIME_END);
-	if (status->flag & (RX_FLAG_MACTIME_START | RX_FLAG_MACTIME_END))
-		return true;
-	/* can't handle non-legacy preamble yet */
-	if (status->flag & RX_FLAG_MACTIME_PLCP_START &&
-	    status->encoding == RX_ENC_LEGACY)
-		return true;
-	return false;
+	return !!(status->flag & (RX_FLAG_MACTIME_START | RX_FLAG_MACTIME_END |
+				  RX_FLAG_MACTIME_PLCP_START));
 }
 
 void ieee80211_vif_inc_num_mcast(struct ieee80211_sub_if_data *sdata);
@@ -1796,7 +1775,7 @@ static inline bool ieee80211_sdata_running(struct ieee80211_sub_if_data *sdata)
 
 /* tx handling */
 void ieee80211_clear_tx_pending(struct ieee80211_local *local);
-void ieee80211_tx_pending(unsigned long data);
+void ieee80211_tx_pending(struct tasklet_struct *t);
 netdev_tx_t ieee80211_monitor_start_xmit(struct sk_buff *skb,
 					 struct net_device *dev);
 netdev_tx_t ieee80211_subif_start_xmit(struct sk_buff *skb,
@@ -2147,7 +2126,7 @@ void ieee80211_txq_remove_vlan(struct ieee80211_local *local,
 			       struct ieee80211_sub_if_data *sdata);
 void ieee80211_fill_txq_stats(struct cfg80211_txq_stats *txqstats,
 			      struct txq_info *txqi);
-void ieee80211_wake_txqs(unsigned long data);
+void ieee80211_wake_txqs(struct tasklet_struct *t);
 void ieee80211_send_auth(struct ieee80211_sub_if_data *sdata,
 			 u16 transaction, u16 auth_alg, u16 status,
 			 const u8 *extra, size_t extra_len, const u8 *bssid,
@@ -2287,7 +2266,6 @@ int ieee80211_check_combinations(struct ieee80211_sub_if_data *sdata,
 				 enum ieee80211_chanctx_mode chanmode,
 				 u8 radar_detect);
 int ieee80211_max_num_channels(struct ieee80211_local *local);
-enum nl80211_chan_width ieee80211_get_sta_bw(struct ieee80211_sta *sta);
 void ieee80211_recalc_chanctx_chantype(struct ieee80211_local *local,
 				       struct ieee80211_chanctx *ctx);
 
@@ -2326,5 +2304,8 @@ u32 ieee80211_calc_expected_tx_airtime(struct ieee80211_hw *hw,
 #else
 #define debug_noinline
 #endif
+
+void ieee80211_init_frag_cache(struct ieee80211_fragment_cache *cache);
+void ieee80211_destroy_frag_cache(struct ieee80211_fragment_cache *cache);
 
 #endif /* IEEE80211_I_H */
